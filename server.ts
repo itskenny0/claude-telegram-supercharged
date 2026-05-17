@@ -149,33 +149,114 @@ const MEMORY_FILE = join(DATA_DIR, "memory.md");
 const MEMORY_MAX_CHARS = 10_000;
 
 // --- Single-instance lock ---
+// We have to guard against three failure modes:
+//   1. Genuine concurrent start (real primary running)  → go secondary
+//   2. PID reuse: a non-bun process happens to own the old PID → take over
+//   3. Transient sibling: a short-lived bun helper claims PID at the exact
+//      moment of kill(0) check, then dies milliseconds later, leaving us
+//      stuck in isSecondary=true forever with no primary actually polling.
+// The original code only handled (1) and crudely (2). Fix:
+//   - Treat any lock not refreshed within LOCK_STALE_MS as dead, regardless
+//     of PID-alive (handles 3 + reboot-leftover staleness).
+//   - Verify the existing PID is actually a bun process via /proc/<pid>/cmdline
+//     (handles 2).
+//   - Primary refreshes the lock mtime every LOCK_HEARTBEAT_MS.
+//   - Secondaries re-check periodically and promote themselves to primary if
+//     the lock is now stale / missing / owned by a dead-or-not-bun PID.
 const LOCK_FILE = join(DATA_DIR, "telegram.lock");
+const LOCK_STALE_MS = 90_000;
+const LOCK_HEARTBEAT_MS = 30_000;
+const PROMOTION_CHECK_MS = 30_000;
 let isSecondary = false; // true when another instance owns the bot polling
+let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+let promotionTimer: ReturnType<typeof setInterval> | undefined;
+
+function isLivePid(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function isLiveBunPid(pid: number): boolean {
+  if (!isLivePid(pid)) return false;
+  // Defense against PID reuse: verify the live PID is actually a bun process.
+  // /proc/<pid>/cmdline is Linux-only; fall back to "alive is good enough"
+  // elsewhere so this stays portable.
+  try {
+    const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
+    return cmdline.includes("bun") || cmdline.includes("server.ts");
+  } catch {
+    return true;
+  }
+}
+
+function lockAgeMs(): number | undefined {
+  try { return Date.now() - statSync(LOCK_FILE).mtimeMs; } catch { return undefined; }
+}
+
+function startHeartbeat(): void {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => {
+    if (isSecondary) return;
+    try { writeFileSync(LOCK_FILE, String(process.pid)); } catch {}
+  }, LOCK_HEARTBEAT_MS);
+}
+
+function startPromotionWatch(): void {
+  if (promotionTimer) clearInterval(promotionTimer);
+  promotionTimer = setInterval(() => {
+    if (!isSecondary) return;
+    try {
+      if (!existsSync(LOCK_FILE)) { promoteToPrimary("lock disappeared"); return; }
+      const age = lockAgeMs();
+      if (age !== undefined && age > LOCK_STALE_MS) {
+        promoteToPrimary(`lock stale (age ${Math.round(age / 1000)}s)`);
+        return;
+      }
+      const pid = Number.parseInt(readFileSync(LOCK_FILE, "utf-8").trim(), 10);
+      if (!Number.isNaN(pid) && !isLiveBunPid(pid)) {
+        promoteToPrimary(`primary pid=${pid} not a live bun`);
+      }
+    } catch (e) {
+      process.stderr.write(`telegram channel: promotion check error: ${e}\n`);
+    }
+  }, PROMOTION_CHECK_MS);
+}
+
+function promoteToPrimary(reason: string): void {
+  process.stderr.write(`telegram channel: promoting to primary (${reason})\n`);
+  isSecondary = false;
+  if (promotionTimer) { clearInterval(promotionTimer); promotionTimer = undefined; }
+  try { writeFileSync(LOCK_FILE, String(process.pid)); } catch {}
+  startHeartbeat();
+  startBotPolling();
+}
 
 function acquireLock(): void {
   if (existsSync(LOCK_FILE)) {
-    const existingPid = Number.parseInt(readFileSync(LOCK_FILE, "utf-8").trim(), 10);
-    if (!Number.isNaN(existingPid)) {
-      try {
-        process.kill(existingPid, 0); // signal 0 = check alive, don't kill
-        // Primary is alive — run in secondary (MCP-only) mode instead of crashing
+    const age = lockAgeMs();
+    if (age !== undefined && age > LOCK_STALE_MS) {
+      process.stderr.write(`telegram channel: lock is stale (mtime ${Math.round(age / 1000)}s ago) — overriding\n`);
+    } else {
+      const existingPid = Number.parseInt(readFileSync(LOCK_FILE, "utf-8").trim(), 10);
+      if (!Number.isNaN(existingPid) && isLiveBunPid(existingPid)) {
         isSecondary = true;
         process.stderr.write(
-          `telegram channel: primary instance running (pid=${existingPid}) — starting in MCP-only mode (tools available, bot polling skipped)\n`,
+          `telegram channel: primary instance running (pid=${existingPid}) — starting in MCP-only mode (tools available, bot polling skipped, will auto-promote if primary dies)\n`,
         );
+        startPromotionWatch();
         return;
-      } catch {
-        // PID is dead — stale lock, safe to overwrite
-        process.stderr.write(`telegram channel: removing stale lock (pid=${existingPid} is dead)\n`);
       }
+      process.stderr.write(`telegram channel: removing stale lock (pid=${existingPid} not a live bun)\n`);
     }
   }
   writeFileSync(LOCK_FILE, String(process.pid));
+  startHeartbeat();
   process.stderr.write(`telegram channel: lock acquired (pid=${process.pid})\n`);
 }
 
 function releaseLock(): void {
   try {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
+    if (promotionTimer) { clearInterval(promotionTimer); promotionTimer = undefined; }
     if (existsSync(LOCK_FILE)) {
       const content = readFileSync(LOCK_FILE, "utf-8").trim();
       if (content === String(process.pid)) rmSync(LOCK_FILE, { force: true });
@@ -3199,7 +3280,7 @@ function replayUnanswered(): void {
   }
 }
 
-if (!isSecondary) {
+function startBotPolling(): void {
   void bot.start({
     allowed_updates: [
       "message",
@@ -3224,8 +3305,13 @@ if (!isSecondary) {
       setTimeout(replayUnanswered, 3000);
     },
   });
+}
+
+if (!isSecondary) {
+  startBotPolling();
 } else {
-  // Secondary: fetch bot info for username without starting polling
+  // Secondary: fetch bot info for username without starting polling.
+  // The promotion watch will call startBotPolling() if/when we take over.
   bot.api.getMe().then((info) => {
     botUsername = info.username;
     process.stderr.write(`telegram channel: MCP-only mode — tools ready for @${info.username}\n`);
