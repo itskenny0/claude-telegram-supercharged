@@ -276,6 +276,33 @@ process.on("SIGTERM", () => {
 
 acquireLock();
 
+// ── Outbound text sanitization (workaround for upstream Claude Code bug) ──
+// Claude Code's JSON request serializer can crash with "no low surrogate
+// in string" when an orphan UTF-16 surrogate ends up in the transcript or
+// in a streamed tool/notification payload. Symptom: API 400, session dies.
+// To shield from inbound Telegram messages with mangled emoji (half-pairs
+// from copy-paste, broken renderers, or buffer-boundary truncation), we
+// strip any unpaired high/low surrogate from every outbound notification
+// content/meta string before sending to the MCP host.
+function sanitizeOrphanSurrogates(s: string): string {
+  return s.replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    "�",
+  );
+}
+function deepSanitize<T>(v: T): T {
+  if (typeof v === "string") return sanitizeOrphanSurrogates(v) as unknown as T;
+  if (Array.isArray(v)) return v.map(deepSanitize) as unknown as T;
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(v as object)) {
+      out[k] = deepSanitize((v as Record<string, unknown>)[k]);
+    }
+    return out as T;
+  }
+  return v;
+}
+
 // ── Telegraph integration ─────────────────────────────────────────────
 // Publishes long-form content to telegra.ph for Instant View in Telegram.
 // Token auto-creates on first use and persists to .env.
@@ -2850,7 +2877,7 @@ bot.on("message_reaction", async (ctx) => {
   const user = reaction.user;
   const username = user && "username" in user ? (user.username ?? String(user.id)) : senderId;
 
-  void mcp.notification({
+  void mcp.notification(deepSanitize({
     method: "notifications/claude/channel",
     params: {
       content: `reacted with ${emojis} to message ${reaction.message_id}`,
@@ -2863,7 +2890,7 @@ bot.on("message_reaction", async (ctx) => {
         event_type: "reaction",
       },
     },
-  });
+  }));
 });
 
 // ── Pre-gate buffer for group messages without mention ──────────────
@@ -2985,7 +3012,7 @@ function flushBatch(chatId: string): void {
     }
   }
 
-  void mcp.notification({
+  void mcp.notification(deepSanitize({
     method: "notifications/claude/channel",
     params: {
       content,
@@ -3006,7 +3033,7 @@ function flushBatch(chatId: string): void {
         ...threadChainContext,
       },
     },
-  });
+  }));
 }
 
 async function handleInbound(
@@ -3259,7 +3286,7 @@ function replayUnanswered(): void {
         `telegram channel: replaying ${unanswered.length} unanswered message(s) in chat ${chatId}\n`,
       );
 
-      void mcp.notification({
+      void mcp.notification(deepSanitize({
         method: "notifications/claude/channel",
         params: {
           content: unanswered.length > 1
@@ -3273,7 +3300,7 @@ function replayUnanswered(): void {
             ts: new Date((last.date as number) * 1000).toISOString(),
           },
         },
-      });
+      }));
     }
   } catch (err) {
     process.stderr.write(`telegram channel: replay check failed: ${err}\n`);
