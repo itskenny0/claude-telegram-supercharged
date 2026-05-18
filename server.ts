@@ -303,6 +303,19 @@ function deepSanitize<T>(v: T): T {
   return v;
 }
 
+// safeSlice: UTF-16 surrogate-safe truncation. JS String.prototype.slice
+// operates on UTF-16 code units, so cutting at N when position N-1 is a
+// lone high surrogate emits a half-pair. Codeslake's diagnosis (commit
+// b8e12dc on codeslake/claude-telegram-supercharged): the recent-history
+// injector's 300-char slice plus emoji-at-boundary = `no low surrogate`
+// API crash. This function clamps the cut back to the last paired
+// boundary before truncating.
+function safeSlice(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const c = s.charCodeAt(n - 1);
+  return c >= 0xD800 && c <= 0xDBFF ? s.slice(0, n - 1) : s.slice(0, n);
+}
+
 // ── Telegraph integration ─────────────────────────────────────────────
 // Publishes long-form content to telegra.ph for Instant View in Telegram.
 // Token auto-creates on first use and persists to .env.
@@ -806,7 +819,7 @@ class MessageStore {
       const replyTag = m.reply_to_msg_id ? ` (reply to #${m.reply_to_msg_id})` : "";
       const topicTag = m.thread_id ? ` [topic:${m.thread_id}]` : "";
       const content = m.text ?? (m.media_type ? `[${m.media_type}]` : "[no text]");
-      return `[${ts}] ${sender}${replyTag}${topicTag}: ${(content as string).slice(0, 300)}`;
+      return `[${ts}] ${sender}${replyTag}${topicTag}: ${safeSlice(content as string, 300)}`;
     });
     return `[Recent history — last ${msgs.length} messages]\n${lines.join("\n")}`;
   }
@@ -1293,7 +1306,7 @@ function chunk(text: string, limit: number, mode: "length" | "newline"): string[
       const space = rest.lastIndexOf(" ", limit);
       cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit;
     }
-    out.push(rest.slice(0, cut));
+    out.push(safeSlice(rest, cut));
     rest = rest.slice(cut).replace(/^\n+/, "");
   }
   if (rest) out.push(rest);
@@ -1748,7 +1761,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         for (const sid of sentIds) {
           trackMessage(chat_id, sid, {
             sender: botUsername ?? "bot",
-            text: text.slice(0, 200),
+            text: safeSlice(text, 200),
             ts: Date.now(),
             replyTo: reply_to,
           });
@@ -1756,7 +1769,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             message_id: sid,
             chat_id,
             username: botUsername ?? "bot",
-            text: text.slice(0, 2000),
+            text: safeSlice(text, 2000),
             reply_to_msg_id: reply_to,
             date: Math.floor(Date.now() / 1000),
             is_outgoing: true,
@@ -1865,7 +1878,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             const replyTag = m.reply_to_msg_id ? ` (reply to #${m.reply_to_msg_id})` : "";
             const topicTag = m.thread_id ? ` [topic:${m.thread_id}]` : "";
             const content = m.text ?? (m.media_type ? `[${m.media_type}]` : "[no text]");
-            return `[${ts}] #${m.message_id} ${sender}${replyTag}${topicTag}: ${(content as string).slice(0, 500)}`;
+            return `[${ts}] #${m.message_id} ${sender}${replyTag}${topicTag}: ${safeSlice(content as string, 500)}`;
           })
           .join("\n");
         return { content: [{ type: "text", text: `${msgs.length} messages:\n\n${formatted}` }] };
@@ -1885,7 +1898,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             const ts = new Date((m.date as number) * 1000).toISOString().slice(0, 16).replace("T", " ");
             const sender = m.is_outgoing ? "[BOT]" : `@${m.username ?? m.user_id ?? "?"}`;
             const content = m.text ?? "[no text]";
-            return `[${ts}] #${m.message_id} ${sender}: ${(content as string).slice(0, 500)}`;
+            return `[${ts}] #${m.message_id} ${sender}: ${safeSlice(content as string, 500)}`;
           })
           .join("\n");
         return { content: [{ type: "text", text: `${msgs.length} matches for "${query}":\n\n${formatted}` }] };
@@ -3156,7 +3169,7 @@ async function deliverMessage(
   if (msgId != null) {
     trackMessage(chat_id, msgId, {
       sender: username,
-      text: text.slice(0, 200),
+      text: safeSlice(text, 200),
       ts: timestamp.getTime(),
       replyTo: replyToMsgId,
       threadId,
@@ -3178,7 +3191,7 @@ async function deliverMessage(
       from_username: replyToMsg.from?.username,
       msg_id: replyToMsg.message_id,
       has_quote: !!(ctx.message as any)?.quote,
-      quote_text: (ctx.message as any)?.quote?.text?.slice(0, 100),
+      quote_text: ((ctx.message as any)?.quote?.text != null ? safeSlice((ctx.message as any).quote.text, 100) : undefined),
     };
     process.stderr.write(`telegram channel: reply_to debug: ${JSON.stringify(debugFields)}\n`);
 
@@ -3203,7 +3216,7 @@ async function deliverMessage(
       replyText = quote.text;
     }
 
-    if (replyText) replyContext.reply_to_text = replyText.slice(0, 1000);
+    if (replyText) replyContext.reply_to_text = safeSlice(replyText, 1000);
 
     if (replyToMsg.from) {
       replyContext.reply_to_user = replyToMsg.from.username ?? String(replyToMsg.from.id);
